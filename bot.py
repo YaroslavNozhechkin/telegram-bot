@@ -1,6 +1,7 @@
 import os
 import telebot
 from telebot import types
+import sqlite3
 import threading
 import time
 import qrcode
@@ -12,9 +13,6 @@ from dotenv import load_dotenv
 import logging
 import atexit
 import sys
-import psycopg2
-from psycopg2 import pool
-import traceback
 
 # ========== ЗАГРУЗКА КОНФИГУРАЦИИ ==========
 # Загружаем переменные окружения из .env файла
@@ -34,13 +32,6 @@ USER_BOT_TOKEN = os.getenv('USER_BOT_TOKEN')
 # Получаем ID админов (через запятую)
 admin_ids_str = os.getenv('ADMIN_IDS', '')
 ADMIN_IDS = [int(id.strip()) for id in admin_ids_str.split(',') if id.strip()]
-
-# Получаем строку подключения к PostgreSQL
-DATABASE_URL = os.getenv('DATABASE_URL')
-if not DATABASE_URL:
-    logger.error("❌ DATABASE_URL не найден!")
-    print("❌ ОШИБКА: DATABASE_URL не найден в переменных окружения!")
-    print("   Для Railway: Добавьте PostgreSQL базу данных и переменную DATABASE_URL будет создана автоматически")
 
 # Проверка токенов (для отладки)
 if not ADMIN_BOT_TOKEN:
@@ -64,142 +55,85 @@ logger.info("🤖 Боты инициализированы")
 print("✅ Токены загружены из .env файла")
 print(f"👑 ID админов: {ADMIN_IDS}")
 
-# ========== СОЗДАНИЕ ПОДКЛЮЧЕНИЯ К POSTGRESQL ==========
-connection_pool = None
+# ========== СОЗДАНИЕ НОВЫХ БАЗ ДАННЫХ ==========
+# 1. База данных для пользователей
+users_conn = sqlite3.connect('users.db', check_same_thread=False)
+users_cursor = users_conn.cursor()
 
-def init_database():
-    """Инициализирует подключение к PostgreSQL и создает таблицы"""
-    global connection_pool
-    
-    try:
-        # Создаем пул соединений
-        connection_pool = psycopg2.pool.SimpleConnectionPool(
-            1,  # минимальное количество соединений
-            20,  # максимальное количество соединений
-            DATABASE_URL,
-            sslmode='require'  # для Railway требуется SSL
-        )
-        
-        print("✅ Подключение к PostgreSQL установлено")
-        
-        # Создаем таблицы
-        create_tables()
-        
-        return True
-    except Exception as e:
-        print(f"❌ Ошибка подключения к PostgreSQL: {e}")
-        traceback.print_exc()
-        return False
+users_cursor.execute('''
+CREATE TABLE IF NOT EXISTS users (
+    telegram_id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    surname TEXT NOT NULL
+)
+''')
+users_conn.commit()
 
-def get_connection():
-    """Получает соединение из пула"""
-    return connection_pool.getconn()
+# 2. База данных для мероприятий
+events_conn = sqlite3.connect('events.db', check_same_thread=False)
+events_cursor = events_conn.cursor()
 
-def return_connection(conn):
-    """Возвращает соединение в пул"""
-    connection_pool.putconn(conn)
+events_cursor.execute('''
+CREATE TABLE IF NOT EXISTS events (
+    event_id INTEGER PRIMARY KEY,
+    event_name TEXT NOT NULL,
+    event_photo_id TEXT,
+    invitation_text TEXT
+)
+''')
+events_conn.commit()
 
-def execute_query(query, params=None, fetchone=False, fetchall=False):
-    """Выполняет SQL запрос"""
-    conn = get_connection()
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute(query, params or ())
-            
-            if fetchone:
-                result = cursor.fetchone()
-            elif fetchall:
-                result = cursor.fetchall()
-            else:
-                result = None
-                
-            conn.commit()
-            return result
-    except Exception as e:
-        print(f"❌ Ошибка выполнения запроса: {e}")
-        print(f"Запрос: {query}")
-        print(f"Параметры: {params}")
-        conn.rollback()
-        raise e
-    finally:
-        return_connection(conn)
+# 3. База данных для ответов пользователей на приглашения
+responses_conn = sqlite3.connect('responses.db', check_same_thread=False)
+responses_cursor = responses_conn.cursor()
 
-def create_tables():
-    """Создает все необходимые таблицы в PostgreSQL"""
-    tables = [
-        '''CREATE TABLE IF NOT EXISTS users (
-            telegram_id BIGINT PRIMARY KEY,
-            name TEXT NOT NULL,
-            surname TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''',
-        
-        '''CREATE TABLE IF NOT EXISTS events (
-            event_id SERIAL PRIMARY KEY,
-            event_name TEXT NOT NULL,
-            event_photo_id TEXT,
-            invitation_text TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''',
-        
-        '''CREATE TABLE IF NOT EXISTS user_responses (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            event_id INTEGER NOT NULL,
-            response TEXT NOT NULL,
-            qr_sent BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, event_id)
-        )''',
-        
-        '''CREATE TABLE IF NOT EXISTS invitation_messages (
-            id SERIAL PRIMARY KEY,
-            message_id INTEGER NOT NULL,
-            user_id BIGINT NOT NULL,
-            event_id INTEGER NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, event_id)
-        )''',
-        
-        '''CREATE TABLE IF NOT EXISTS attendance (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            event_name TEXT NOT NULL,
-            attendance_status INTEGER DEFAULT 0,  -- 0 = не отсканирован, 1 = отсканирован
-            scanned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, event_name)
-        )'''
-    ]
-    
-    # Создаем таблицы
-    for table_query in tables:
-        execute_query(table_query)
-    
-    # Создаем индексы
-    indexes = [
-        'CREATE INDEX IF NOT EXISTS idx_user_responses_user_event ON user_responses (user_id, event_id)',
-        'CREATE INDEX IF NOT EXISTS idx_invitation_messages_user_event ON invitation_messages (user_id, event_id)',
-        'CREATE INDEX IF NOT EXISTS idx_attendance_user_event ON attendance (user_id, event_name)',
-        'CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users (telegram_id)',
-        'CREATE INDEX IF NOT EXISTS idx_events_event_id ON events (event_id)'
-    ]
-    
-    for index_query in indexes:
-        try:
-            execute_query(index_query)
-        except:
-            pass  # Индекс уже существует
-    
-    print("✅ Все таблицы PostgreSQL созданы/проверены")
+responses_cursor.execute('''
+CREATE TABLE IF NOT EXISTS user_responses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    event_id INTEGER NOT NULL,
+    response TEXT NOT NULL,
+    qr_sent BOOLEAN DEFAULT 0,
+    UNIQUE(user_id, event_id)
+)
+''')
 
-# Инициализируем базу данных
-if not init_database():
-    print("❌ Не удалось инициализировать базу данных!")
-    sys.exit(1)
+# 4. Таблица для хранения сообщений приглашений
+responses_cursor.execute('''
+CREATE TABLE IF NOT EXISTS invitation_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    event_id INTEGER NOT NULL,
+    UNIQUE(user_id, event_id)
+)
+''')
+
+# 5. БАЗА ДАННЫХ ДЛЯ ПОСЕЩАЕМОСТИ (УПРОЩЕННАЯ)
+attendance_conn = sqlite3.connect('attendance.db', check_same_thread=False)
+attendance_cursor = attendance_conn.cursor()
+
+attendance_cursor.execute('''
+CREATE TABLE IF NOT EXISTS attendance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    event_name TEXT NOT NULL,
+    attendance_status INTEGER DEFAULT 0,  -- 0 = не отсканирован, 1 = отсканирован
+    UNIQUE(user_id, event_name)
+)
+''')
+
+# Создаем индексы
+responses_cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_event ON user_responses (user_id, event_id)')
+responses_cursor.execute('CREATE INDEX IF NOT EXISTS idx_msg_user_event ON invitation_messages (user_id, event_id)')
+attendance_cursor.execute('CREATE INDEX IF NOT EXISTS idx_attendance_user_event ON attendance (user_id, event_name)')
+
+responses_conn.commit()
+attendance_conn.commit()
 
 print("🤖 Запуск системы приглашений...")
+print("✅ Все базы данных созданы/проверены")
 
-# ========== КЛАВИАТУРЫ ==========
 # Обычная пользовательская клавиатура (используется после регистрации)
 user_keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
 user_keyboard.add("📝 Регистрация (/start)", "🆔 Мой ID (/id)")
@@ -217,7 +151,8 @@ admin_cancel_keyboard.add("❌ Отмена")
 admin_keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
 admin_keyboard.add("/Sending_messages", "/scan_qr", "/announce", "/edit_user", "/cancel")
 
-# ========== ФУНКЦИИ ДЛЯ РАБОТЫ С БАЗОЙ ДАННЫХ ==========
+
+# ========== ФУНКЦИИ ==========
 def create_inline_keyboard(event_id):
     """Создает инлайн-клавиатуру для конкретного мероприятия"""
     keyboard = types.InlineKeyboardMarkup(row_width=2)
@@ -231,6 +166,7 @@ def create_inline_keyboard(event_id):
     )
 
     return keyboard
+
 
 def create_qr_code(event_number, user_id):
     """Создает QR-код с данными: номер мероприятия + 'U' + ID пользователя"""
@@ -253,97 +189,102 @@ def create_qr_code(event_number, user_id):
 
     return bio, qr_data
 
+
 def get_next_event_number():
     """Получает следующий номер мероприятия"""
-    result = execute_query('SELECT MAX(event_id) FROM events', fetchone=True)
-    if result and result[0] is not None:
-        return result[0] + 1
-    return 1
+    events_cursor.execute('SELECT MAX(event_id) FROM events')
+    result = events_cursor.fetchone()[0]
+    if result is None:
+        return 1
+    return result + 1
+
 
 def check_user_response(user_id, event_id):
     """Проверяет ответ пользователя на приглашение"""
-    return execute_query(
-        'SELECT response, qr_sent FROM user_responses WHERE user_id = %s AND event_id = %s',
-        (user_id, event_id),
-        fetchone=True
+    responses_cursor.execute(
+        'SELECT response, qr_sent FROM user_responses WHERE user_id = ? AND event_id = ?',
+        (user_id, event_id)
     )
+    return responses_cursor.fetchone()
+
 
 def save_user_response(user_id, event_id, response):
     """Сохраняет ответ пользователя"""
     try:
-        execute_query(
-            '''INSERT INTO user_responses (user_id, event_id, response, qr_sent) 
-               VALUES (%s, %s, %s, FALSE)
-               ON CONFLICT (user_id, event_id) 
-               DO UPDATE SET response = EXCLUDED.response, qr_sent = FALSE''',
+        responses_cursor.execute(
+            'INSERT OR REPLACE INTO user_responses (user_id, event_id, response, qr_sent) VALUES (?, ?, ?, 0)',
             (user_id, event_id, response)
         )
+        responses_conn.commit()
         return True
     except Exception as e:
         print(f"❌ Ошибка сохранения ответа: {e}")
         return False
 
+
 def mark_qr_sent(user_id, event_id):
     """Отмечает что QR-код отправлен"""
     try:
-        execute_query(
-            'UPDATE user_responses SET qr_sent = TRUE WHERE user_id = %s AND event_id = %s',
+        responses_cursor.execute(
+            'UPDATE user_responses SET qr_sent = 1 WHERE user_id = ? AND event_id = ?',
             (user_id, event_id)
         )
+        responses_conn.commit()
         return True
     except Exception as e:
         print(f"❌ Ошибка обновления статуса QR: {e}")
         return False
 
+
 def save_invitation_message(user_id, event_id, message_id):
     """Сохраняет ID сообщения с приглашением"""
     try:
-        execute_query(
-            '''INSERT INTO invitation_messages (user_id, event_id, message_id) 
-               VALUES (%s, %s, %s)
-               ON CONFLICT (user_id, event_id) 
-               DO UPDATE SET message_id = EXCLUDED.message_id''',
+        responses_cursor.execute(
+            'INSERT OR REPLACE INTO invitation_messages (user_id, event_id, message_id) VALUES (?, ?, ?)',
             (user_id, event_id, message_id)
         )
+        responses_conn.commit()
         return True
     except Exception as e:
         print(f"❌ Ошибка сохранения ID сообщения: {e}")
         return False
 
+
 def get_invitation_message_id(user_id, event_id):
     """Получает ID сообщения с приглашением"""
-    result = execute_query(
-        'SELECT message_id FROM invitation_messages WHERE user_id = %s AND event_id = %s',
-        (user_id, event_id),
-        fetchone=True
+    responses_cursor.execute(
+        'SELECT message_id FROM invitation_messages WHERE user_id = ? AND event_id = ?',
+        (user_id, event_id)
     )
+    result = responses_cursor.fetchone()
     return result[0] if result else None
+
 
 def mark_attendance(user_id, event_name):
     """Отмечает посещение пользователя"""
     try:
         # Проверяем, не отмечен ли уже пользователь
-        existing = execute_query(
-            'SELECT attendance_status FROM attendance WHERE user_id = %s AND event_name = %s',
-            (user_id, event_name),
-            fetchone=True
+        attendance_cursor.execute(
+            'SELECT attendance_status FROM attendance WHERE user_id = ? AND event_name = ?',
+            (user_id, event_name)
         )
+        existing = attendance_cursor.fetchone()
 
         if existing and existing[0] == 1:
             return "already_scanned"  # Уже отсканирован
 
         # Добавляем или обновляем запись
-        execute_query(
-            '''INSERT INTO attendance (user_id, event_name, attendance_status) 
-               VALUES (%s, %s, %s)
-               ON CONFLICT (user_id, event_name) 
-               DO UPDATE SET attendance_status = EXCLUDED.attendance_status, scanned_at = CURRENT_TIMESTAMP''',
+        attendance_cursor.execute(
+            'INSERT OR REPLACE INTO attendance (user_id, event_name, attendance_status) '
+            'VALUES (?, ?, ?)',
             (user_id, event_name, 1)
         )
+        attendance_conn.commit()
         return "success"
     except Exception as e:
         print(f"❌ Ошибка отметки посещения: {e}")
         return "error"
+
 
 def decode_qr_code_from_photo(file_path):
     """УЛУЧШЕННАЯ функция сканирования QR-кодов"""
@@ -417,6 +358,7 @@ def decode_qr_code_from_photo(file_path):
     except Exception as e:
         print(f"❌ Ошибка сканирования: {e}")
         return None
+
 
 def enhanced_qr_decode(file_path):
     """УЛУЧШЕННАЯ функция сканирования QR-кодов с дополнительными методами"""
@@ -502,6 +444,7 @@ def enhanced_qr_decode(file_path):
         print(f"❌ Ошибка в улучшенном сканировании: {e}")
         return None
 
+
 def send_invitation_to_user(user_id, name, surname, event_id, event_name, invitation_text, event_photo_id=None):
     """Отправляет приглашение пользователю с инлайн-кнопками и фотографией"""
     try:
@@ -568,10 +511,12 @@ def send_invitation_to_user(user_id, name, surname, event_id, event_name, invita
         print(f"❌ Ошибка отправки приглашения пользователю {user_id}: {e}")
         return False
 
+
 def broadcast_message_to_all(chat_id, message_text):
     """Рассылает сообщение всем пользователям"""
     try:
-        users = execute_query('SELECT telegram_id, name, surname FROM users', fetchall=True)
+        users_cursor.execute('SELECT telegram_id, name, surname FROM users')
+        users = users_cursor.fetchall()
 
         sent = 0
         failed = 0
@@ -583,30 +528,29 @@ def broadcast_message_to_all(chat_id, message_text):
 
         admin_bot.send_message(chat_id,
                                f"📤 Начинаю рассылку сообщения...\n\n"
-                               f"👥 Пользователей: {len(users) if users else 0}\n"
+                               f"👥 Пользователей: {len(users)}\n"
                                f"📝 Сообщение: {message_text[:50]}...")
 
-        if users:
-            for user in users:
-                user_id, name, surname = user
-                try:
-                    # Отправляем через пользовательского бота
-                    user_bot.send_message(
-                        user_id,
-                        broadcast_message,
-                        parse_mode='Markdown'
-                    )
-                    sent += 1
-                    time.sleep(0.2)  # Пауза чтобы не было ограничений
+        for user in users:
+            user_id, name, surname = user
+            try:
+                # Отправляем через пользовательского бота
+                user_bot.send_message(
+                    user_id,
+                    broadcast_message,
+                    parse_mode='Markdown'
+                )
+                sent += 1
+                time.sleep(0.2)  # Пауза чтобы не было ограничений
 
-                except Exception as e:
-                    failed += 1
-                    print(f"❌ Ошибка отправки пользователю {user_id}: {e}")
+            except Exception as e:
+                failed += 1
+                print(f"❌ Ошибка отправки пользователю {user_id}: {e}")
 
         stats_message = (
             f"✅ Рассылка завершена!\n\n"
             f"📝 Сообщение: {message_text[:100]}...\n"
-            f"👥 Всего пользователей: {len(users) if users else 0}\n"
+            f"👥 Всего пользователей: {len(users)}\n"
             f"✅ Успешно отправлено: {sent}\n"
             f"❌ Не удалось отправить: {failed}"
         )
@@ -621,12 +565,15 @@ def broadcast_message_to_all(chat_id, message_text):
                                reply_markup=admin_keyboard)
         return False
 
+
 # ========== ПОЛЬЗОВАТЕЛЬСКИЙ БОТ ==========
 user_data = {}
+
 
 def is_command(text):
     """Проверяет, является ли текст командой (начинается с /)"""
     return text and text.startswith('/')
+
 
 def is_invalid_name(text):
     """Проверяет, является ли текст недопустимым для имени/фамилии"""
@@ -649,14 +596,12 @@ def is_invalid_name(text):
 
     return False
 
+
 def is_user_registered(user_id):
     """Проверяет, зарегистрирован ли пользователь"""
-    result = execute_query(
-        'SELECT telegram_id FROM users WHERE telegram_id = %s',
-        (user_id,),
-        fetchone=True
-    )
-    return result is not None
+    users_cursor.execute('SELECT telegram_id FROM users WHERE telegram_id = ?', (user_id,))
+    return users_cursor.fetchone() is not None
+
 
 @user_bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -664,29 +609,24 @@ def send_welcome(message):
 
     # Проверяем, не зарегистрирован ли пользователь уже
     if is_user_registered(user_id):
-        user_info = execute_query(
-            'SELECT name, surname FROM users WHERE telegram_id = %s',
-            (user_id,),
-            fetchone=True
+        users_cursor.execute('SELECT name, surname FROM users WHERE telegram_id = ?', (user_id,))
+        user_info = users_cursor.fetchone()
+        name, surname = user_info
+
+        already_registered_text = (
+            "👋 *Вы уже зарегистрированы!*\n\n"
+            f"👤 *Имя:* {name}\n"
+            f"👥 *Фамилия:* {surname}\n\n"
+            "✅ Вы уже зарегистрированы и будете получать приглашения на мероприятия.\n\n"
+            "📱 *Доступные команды:*\n"
+            "/admin - Проверить админ права\n"
+            "/id - Узнать свой ID"
         )
-        
-        if user_info:
-            name, surname = user_info
 
-            already_registered_text = (
-                "👋 *Вы уже зарегистрированы!*\n\n"
-                f"👤 *Имя:* {name}\n"
-                f"👥 *Фамилия:* {surname}\n\n"
-                "✅ Вы уже зарегистрированы и будете получать приглашения на мероприятия.\n\n"
-                "📱 *Доступные команды:*\n"
-                "/admin - Проверить админ права\n"
-                "/id - Узнать свой ID"
-            )
-
-            user_bot.send_message(message.chat.id, already_registered_text,
-                                  parse_mode='Markdown',
-                                  reply_markup=user_keyboard)
-            return
+        user_bot.send_message(message.chat.id, already_registered_text,
+                              parse_mode='Markdown',
+                              reply_markup=user_keyboard)
+        return
 
     # Если не зарегистрирован, начинаем регистрацию
     user_data[user_id] = {'step': 'name'}
@@ -701,6 +641,7 @@ def send_welcome(message):
     msg = user_bot.send_message(message.chat.id, welcome_text,
                                 parse_mode='Markdown')
     user_bot.register_next_step_handler(msg, get_name)
+
 
 def get_name(message):
     user_id = message.from_user.id
@@ -737,6 +678,7 @@ def get_name(message):
                           f"✅ Имя принято: {message.text.strip()}\n\n"
                           "Теперь введите вашу фамилию:")
     user_bot.register_next_step_handler(message, get_surname)
+
 
 def get_surname(message):
     user_id = message.from_user.id
@@ -776,13 +718,11 @@ def get_surname(message):
     surname = message.text.strip()
 
     try:
-        execute_query(
-            '''INSERT INTO users (telegram_id, name, surname) 
-               VALUES (%s, %s, %s)
-               ON CONFLICT (telegram_id) 
-               DO UPDATE SET name = EXCLUDED.name, surname = EXCLUDED.surname''',
+        users_cursor.execute(
+            'INSERT OR REPLACE INTO users (telegram_id, name, surname) VALUES (?, ?, ?)',
             (user_id, name, surname)
         )
+        users_conn.commit()
 
         success_text = (
             "✅ *Регистрация завершена!*\n\n"
@@ -810,6 +750,7 @@ def get_surname(message):
     if user_id in user_data:
         del user_data[user_id]
 
+
 @user_bot.callback_query_handler(func=lambda call: call.data.startswith('response_'))
 def handle_inline_response(call):
     """Обрабатывает ответ пользователя через инлайн кнопки"""
@@ -826,11 +767,8 @@ def handle_inline_response(call):
     event_id = int(parts[3])  # ID мероприятия
 
     # Получаем информацию о пользователе
-    user_info = execute_query(
-        'SELECT name, surname FROM users WHERE telegram_id = %s',
-        (user_id,),
-        fetchone=True
-    )
+    users_cursor.execute('SELECT name, surname FROM users WHERE telegram_id = ?', (user_id,))
+    user_info = users_cursor.fetchone()
 
     if not user_info:
         user_bot.answer_callback_query(call.id, "❌ Сначала зарегистрируйтесь через /start")
@@ -840,11 +778,9 @@ def handle_inline_response(call):
     name, surname = user_info
 
     # Получаем информацию о мероприятии
-    event_info = execute_query(
-        'SELECT event_name, invitation_text, event_photo_id FROM events WHERE event_id = %s',
-        (event_id,),
-        fetchone=True
-    )
+    events_cursor.execute('SELECT event_name, invitation_text, event_photo_id FROM events WHERE event_id = ?',
+                          (event_id,))
+    event_info = events_cursor.fetchone()
 
     if not event_info:
         user_bot.answer_callback_query(call.id, "❌ Мероприятие не найдено")
@@ -900,7 +836,11 @@ def handle_inline_response(call):
 
     try:
         # Сохраняем ответ пользователя
-        save_user_response(user_id, event_id, response_type)
+        responses_cursor.execute(
+            'INSERT OR REPLACE INTO user_responses (user_id, event_id, response, qr_sent) VALUES (?, ?, ?, 0)',
+            (user_id, event_id, response_type)
+        )
+        responses_conn.commit()
 
     except Exception as e:
         print(f"❌ Ошибка сохранения ответа: {e}")
@@ -965,13 +905,11 @@ def handle_inline_response(call):
 
             # Создаем запись в таблице посещаемости со статусом 0 (не отсканирован)
             try:
-                execute_query(
-                    '''INSERT INTO attendance (user_id, event_name, attendance_status) 
-                       VALUES (%s, %s, %s)
-                       ON CONFLICT (user_id, event_name) 
-                       DO NOTHING''',
+                attendance_cursor.execute(
+                    'INSERT OR IGNORE INTO attendance (user_id, event_name, attendance_status) VALUES (?, ?, ?)',
                     (user_id, event_name, 0)
                 )
+                attendance_conn.commit()
             except Exception as attendance_error:
                 print(f"❌ Ошибка создания записи о посещаемости: {attendance_error}")
 
@@ -1035,6 +973,7 @@ def handle_inline_response(call):
 
         user_bot.answer_callback_query(call.id, "❌ Ваш отказ сохранен")
 
+
 @user_bot.message_handler(commands=['admin'])
 def admin(message):
     # Проверяем, зарегистрирован ли пользователь
@@ -1049,6 +988,7 @@ def admin(message):
                                 "_Для отмены нажмите кнопку ниже_",
                                 reply_markup=admin_cancel_keyboard)
     user_bot.register_next_step_handler(msg, check_admin_status)
+
 
 def check_admin_status(message):
     # Проверяем, если пользователь хочет отменить
@@ -1071,6 +1011,7 @@ def check_admin_status(message):
                               "Попробуйте снова: /admin",
                               reply_markup=user_keyboard)
 
+
 @user_bot.message_handler(commands=['id'])
 def send_user_id(message):
     # Проверяем, зарегистрирован ли пользователь
@@ -1084,6 +1025,7 @@ def send_user_id(message):
                       f"Ваш ID: `{message.from_user.id}`",
                       parse_mode='Markdown',
                       reply_markup=user_keyboard)
+
 
 @user_bot.message_handler(func=lambda message: True)
 def handle_all_messages(message):
@@ -1119,10 +1061,12 @@ def handle_all_messages(message):
                               "Для регистрации используйте команду /start",
                               reply_markup=user_keyboard)
 
+
 # ========== АДМИН БОТ ==========
 def is_cancel_command(text):
     """Проверяет, является ли сообщение командой отмены"""
     return text in ["❌ Отмена", "/cancel"]
+
 
 @admin_bot.message_handler(commands=['edit_user'])
 def edit_user_command(message):
@@ -1141,11 +1085,12 @@ def edit_user_command(message):
                            "`ID_пользователя Новое_Имя Новая_Фамилия`\n\n"
                            "Пример:\n"
                            "`123456789 Иван Петров`\n\n"
-                           "Или нажмите ❌ Отмена для отмены",
+                           "Или нажмите ❌ Отмена для отмена",
                            parse_mode='Markdown',
                            reply_markup=cancel_keyboard)
 
     admin_bot.register_next_step_handler(message, process_user_edit)
+
 
 def process_user_edit(message):
     """Обрабатывает редактирование пользователя"""
@@ -1188,11 +1133,8 @@ def process_user_edit(message):
             return
 
         # Проверяем, существует ли пользователь
-        user_info = execute_query(
-            'SELECT name, surname FROM users WHERE telegram_id = %s',
-            (user_id,),
-            fetchone=True
-        )
+        users_cursor.execute('SELECT name, surname FROM users WHERE telegram_id = ?', (user_id,))
+        user_info = users_cursor.fetchone()
 
         if not user_info:
             admin_bot.send_message(message.chat.id,
@@ -1206,10 +1148,11 @@ def process_user_edit(message):
 
         # Обновляем данные пользователя
         try:
-            execute_query(
-                'UPDATE users SET name = %s, surname = %s WHERE telegram_id = %s',
+            users_cursor.execute(
+                'UPDATE users SET name = ?, surname = ? WHERE telegram_id = ?',
                 (name, surname, user_id)
             )
+            users_conn.commit()
 
             response = (
                 f"✅ *Данные пользователя обновлены!*\n\n"
@@ -1248,6 +1191,7 @@ def process_user_edit(message):
                                f"Попробуйте снова: /edit_user",
                                reply_markup=admin_keyboard)
 
+
 @admin_bot.message_handler(commands=['scan_qr'])
 def scan_qr_command(message):
     """Команда для сканирования QR-кодов"""
@@ -1258,6 +1202,7 @@ def scan_qr_command(message):
                            reply_markup=cancel_keyboard)
 
     admin_bot.register_next_step_handler(message, process_qr_scan)
+
 
 def process_qr_scan(message):
     """Обрабатывает фото с QR-кодом"""
@@ -1317,11 +1262,8 @@ def process_qr_scan(message):
                 user_id = int(user_id_str)
 
                 # Проверяем пользователя
-                user = execute_query(
-                    'SELECT name, surname FROM users WHERE telegram_id = %s',
-                    (user_id,),
-                    fetchone=True
-                )
+                users_cursor.execute('SELECT name, surname FROM users WHERE telegram_id = ?', (user_id,))
+                user = users_cursor.fetchone()
 
                 if not user:
                     admin_bot.send_message(message.chat.id,
@@ -1335,11 +1277,8 @@ def process_qr_scan(message):
                 name, surname = user
 
                 # Проверяем мероприятие
-                event = execute_query(
-                    'SELECT event_name FROM events WHERE event_id = %s',
-                    (event_id,),
-                    fetchone=True
-                )
+                events_cursor.execute('SELECT event_name FROM events WHERE event_id = ?', (event_id,))
+                event = events_cursor.fetchone()
 
                 if not event:
                     admin_bot.send_message(message.chat.id,
@@ -1351,12 +1290,12 @@ def process_qr_scan(message):
                 event_name = event[0]
 
                 # Проверяем, есть ли уже запись о посещении
-                attendance_record = execute_query(
-                    '''SELECT attendance_status FROM attendance 
-                       WHERE user_id = %s AND event_name = %s''',
-                    (user_id, event_name),
-                    fetchone=True
-                )
+                attendance_cursor.execute('''
+                    SELECT attendance_status FROM attendance 
+                    WHERE user_id = ? AND event_name = ?
+                ''', (user_id, event_name))
+
+                attendance_record = attendance_cursor.fetchone()
 
                 if attendance_record:
                     attendance_status = attendance_record[0]
@@ -1387,21 +1326,17 @@ def process_qr_scan(message):
                     print(f"📱 Отсканирован: {name} {surname} на {event_name}")
 
                     # Создаем запись в user_responses если её нет
-                    existing_response = execute_query(
-                        '''SELECT response FROM user_responses 
-                           WHERE user_id = %s AND event_id = %s''',
-                        (user_id, event_id),
-                        fetchone=True
-                    )
+                    responses_cursor.execute('''
+                        SELECT response FROM user_responses 
+                        WHERE user_id = ? AND event_id = ?
+                    ''', (user_id, event_id))
 
-                    if not existing_response:
-                        execute_query(
-                            '''INSERT INTO user_responses (user_id, event_id, response, qr_sent) 
-                               VALUES (%s, %s, %s, %s)
-                               ON CONFLICT (user_id, event_id) 
-                               DO UPDATE SET response = EXCLUDED.response, qr_sent = EXCLUDED.qr_sent''',
-                            (user_id, event_id, 'yes', True)
+                    if not responses_cursor.fetchone():
+                        responses_cursor.execute(
+                            'INSERT OR REPLACE INTO user_responses (user_id, event_id, response, qr_sent) VALUES (?, ?, ?, 1)',
+                            (user_id, event_id, 'yes', 1)
                         )
+                        responses_conn.commit()
 
                 elif attendance_result == "already_scanned":
                     response = (
@@ -1456,6 +1391,7 @@ def process_qr_scan(message):
                                f"Попробуйте снова: /scan_qr",
                                reply_markup=admin_keyboard)
 
+
 @admin_bot.message_handler(commands=['Sending_messages'])
 def admin_sending(message):
     event_num = get_next_event_number()
@@ -1474,6 +1410,7 @@ def admin_sending(message):
                            f"Или нажмите ❌ Отмена для отмены",
                            reply_markup=cancel_keyboard)
     admin_bot.register_next_step_handler(message, get_event_name)
+
 
 def get_event_name(message):
     if is_cancel_command(message.text):
@@ -1506,6 +1443,7 @@ def get_event_name(message):
                            f"Или нажмите ❌ Отмена для отмены",
                            reply_markup=cancel_keyboard)
     admin_bot.register_next_step_handler(message, get_event_photo)
+
 
 def get_event_photo(message):
     if is_cancel_command(message.text):
@@ -1555,6 +1493,7 @@ def get_event_photo(message):
     user_data['step'] = 'waiting_for_invitation_text'
     admin_bot.register_next_step_handler(message, get_invitation_text)
 
+
 def get_invitation_text(message):
     if is_cancel_command(message.text):
         admin_bot.send_message(message.chat.id,
@@ -1584,10 +1523,11 @@ def get_invitation_text(message):
         return
 
     try:
-        execute_query(
-            'INSERT INTO events (event_id, event_name, invitation_text, event_photo_id) VALUES (%s, %s, %s, %s)',
+        events_cursor.execute(
+            'INSERT INTO events (event_id, event_name, invitation_text, event_photo_id) VALUES (?, ?, ?, ?)',
             (event_num, event_name, invitation_text, event_photo_id)
         )
+        events_conn.commit()
 
         print(f"🎫 Создано мероприятие: №{event_num} - {event_name}")
 
@@ -1611,49 +1551,50 @@ def get_invitation_text(message):
                                f"Попробуйте снова: /Sending_messages",
                                reply_markup=admin_keyboard)
 
+
 def start_broadcast(chat_id, event_num, event_name, invitation_text, event_photo_id=None):
     """Начинает рассылку приглашений"""
-    users = execute_query('SELECT telegram_id, name, surname FROM users', fetchall=True)
+    users_cursor.execute('SELECT telegram_id, name, surname FROM users')
+    users = users_cursor.fetchall()
 
     sent = 0
     failed = 0
 
-    print(f"📤 Начинаю рассылку приглашений на {event_name} ({len(users) if users else 0} пользователей)")
+    print(f"📤 Начинаю рассылку приглашений на {event_name} ({len(users)} пользователей)")
 
     admin_bot.send_message(chat_id,
                            f"🚀 Начинаю рассылку...\n\n"
-                           f"👥 Пользователей: {len(users) if users else 0}\n"
+                           f"👥 Пользователей: {len(users)}\n"
                            f"🎫 Мероприятие: {event_name}\n"
                            f"📸 С фото: {'✅ Да' if event_photo_id else '❌ Нет'}")
 
-    if users:
-        for user in users:
-            user_id, name, surname = user
-            try:
-                success = send_invitation_to_user(
-                    user_id, name, surname,
-                    event_num, event_name,
-                    invitation_text,
-                    event_photo_id
-                )
+    for user in users:
+        user_id, name, surname = user
+        try:
+            success = send_invitation_to_user(
+                user_id, name, surname,
+                event_num, event_name,
+                invitation_text,
+                event_photo_id
+            )
 
-                if success:
-                    sent += 1
-                else:
-                    failed += 1
-                    print(f"❌ Ошибка отправки приглашения {name} {surname}")
-
-                time.sleep(0.3)
-
-            except Exception as e:
+            if success:
+                sent += 1
+            else:
                 failed += 1
-                print(f"❌ Критическая ошибка отправки пользователю {user_id}: {e}")
+                print(f"❌ Ошибка отправки приглашения {name} {surname}")
+
+            time.sleep(0.3)
+
+        except Exception as e:
+            failed += 1
+            print(f"❌ Критическая ошибка отправки пользователю {user_id}: {e}")
 
     stats_message = (
         f"✅ Рассылка завершена!\n\n"
         f"🎫 Мероприятие: №{event_num} - {event_name}\n"
         f"📸 С фото: {'✅ Да' if event_photo_id else '❌ Нет'}\n"
-        f"👥 Всего пользователей: {len(users) if users else 0}\n"
+        f"👥 Всего пользователей: {len(users)}\n"
         f"✅ Успешно отправлено: {sent}\n"
         f"❌ Не удалось отправить: {failed}\n\n"
         f"📊 QR-коды будут отправлены пользователям, которые ответят 'Да'"
@@ -1666,6 +1607,7 @@ def start_broadcast(chat_id, event_num, event_name, invitation_text, event_photo
 
     if hasattr(admin_bot, 'user_data') and chat_id in admin_bot.user_data:
         del admin_bot.user_data[chat_id]
+
 
 @admin_bot.message_handler(commands=['announce'])
 def announce_command(message):
@@ -1686,6 +1628,7 @@ def announce_command(message):
                            reply_markup=cancel_keyboard)
 
     admin_bot.register_next_step_handler(message, process_announcement_message)
+
 
 def process_announcement_message(message):
     """Обрабатывает сообщение для рассылки"""
@@ -1711,6 +1654,7 @@ def process_announcement_message(message):
 
     broadcast_message_to_all(message.chat.id, message_text)
 
+
 @admin_bot.message_handler(commands=['cancel'])
 def cancel_command(message):
     if hasattr(admin_bot, 'user_data') and message.chat.id in admin_bot.user_data:
@@ -1720,8 +1664,9 @@ def cancel_command(message):
         del admin_bot.user_data[message.chat.id]
     else:
         admin_bot.send_message(message.chat.id,
-                               "❌ Нет активной операции для отмены",
+                               "❌ Нет активной операции для отменя",
                                reply_markup=admin_keyboard)
+
 
 @admin_bot.message_handler(commands=['start'])
 def admin_start(message):
@@ -1734,6 +1679,7 @@ def admin_start(message):
                            "/edit_user - Редактировать данные пользователя\n"
                            "/cancel - Отмена текущей операции",
                            reply_markup=admin_keyboard)
+
 
 @admin_bot.message_handler(func=lambda message: True)
 def handle_admin_messages(message):
@@ -1752,6 +1698,7 @@ def handle_admin_messages(message):
                                "Используйте команды из меню",
                                reply_markup=admin_keyboard)
 
+
 # ========== ЗАПУСК БОТОВ ==========
 def run_bot(bot, bot_name):
     """Запускает бота с перезапуском при ошибках"""
@@ -1763,22 +1710,45 @@ def run_bot(bot, bot_name):
             print(f"🔄 Перезапуск {bot_name} через 5 секунд...")
             time.sleep(5)
 
+
 # ========== ФУНКЦИЯ ДЛЯ КОРРЕКТНОГО ЗАВЕРШЕНИЯ ==========
 def cleanup():
-    """Закрываем соединения при выходе"""
+    """Закрываем соединения с БД при выходе"""
     print("\n" + "=" * 50)
     print("🔴 ЗАВЕРШЕНИЕ РАБОТЫ БОТА")
     print("=" * 50)
 
     try:
-        if connection_pool:
-            connection_pool.closeall()
-            print("✅ Закрыто соединение с PostgreSQL")
+        if 'users_conn' in globals():
+            users_conn.close()
+            print("✅ Закрыто соединение users.db")
+    except:
+        pass
+
+    try:
+        if 'events_conn' in globals():
+            events_conn.close()
+            print("✅ Закрыто соединение events.db")
+    except:
+        pass
+
+    try:
+        if 'responses_conn' in globals():
+            responses_conn.close()
+            print("✅ Закрыто соединение responses.db")
+    except:
+        pass
+
+    try:
+        if 'attendance_conn' in globals():
+            attendance_conn.close()
+            print("✅ Закрыто соединение attendance.db")
     except:
         pass
 
     print("✅ Все соединения закрыты")
     print("=" * 50)
+
 
 # Регистрируем функцию очистки
 atexit.register(cleanup)
@@ -1791,7 +1761,6 @@ if __name__ == '__main__':
     print(f"👑 Администраторы: {ADMIN_IDS}")
     print(f"🤖 Админ-бот: {'✅ Загружен' if ADMIN_BOT_TOKEN else '❌ Ошибка'}")
     print(f"👤 Пользовательский бот: {'✅ Загружен' if USER_BOT_TOKEN else '❌ Ошибка'}")
-    print(f"🗄️ PostgreSQL: {'✅ Подключен' if DATABASE_URL else '❌ Ошибка'}")
     print("=" * 50)
 
     # Проверяем токены перед запуском
@@ -1801,11 +1770,6 @@ if __name__ == '__main__':
         print("   Убедитесь что там есть ADMIN_BOT_TOKEN и USER_BOT_TOKEN")
         input("   Нажмите Enter для выхода...")
         exit(1)
-
-    if not DATABASE_URL:
-        print("⚠️ ВНИМАНИЕ: DATABASE_URL не найден!")
-        print("   Для локальной разработки можно использовать SQLite")
-        print("   Для продакшена добавьте PostgreSQL базу данных")
 
     try:
         print("🚀 Запуск ботов...")
@@ -1839,7 +1803,7 @@ if __name__ == '__main__':
     except Exception as e:
         print(f"❌ КРИТИЧЕСКАЯ ОШИБКА ПРИ ЗАПУСКЕ: {e}")
         import traceback
+
         traceback.print_exc()
         print("\n⚠️ Подробности ошибки выше")
         input("Нажмите Enter для выхода...")
-
