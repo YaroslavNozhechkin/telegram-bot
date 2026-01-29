@@ -1,4 +1,3 @@
-python
 import os
 import telebot
 from telebot import types
@@ -1843,3 +1842,4 @@ if __name__ == '__main__':
         traceback.print_exc()
         print("\n⚠️ Подробности ошибки выше")
         input("Нажмите Enter для выхода...")
+
